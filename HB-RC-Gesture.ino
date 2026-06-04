@@ -50,8 +50,12 @@
 //   Default ~280 µA -> 8-10 Monate auf 2× AAA
 #define ACTIVE_HOLD_MS       5000   // Nach letzter Geste in ACTIVE bleiben
 #define WAKE_INTERVAL_MS      250   // Periodische Wakeups im SUSPEND
-#define CHECK_WINDOW_MS        50   // Detection-Fenster nach jedem Wakeup
-                                    // (PAJ braucht >=30 ms fuer eine Geste)
+#define CHECK_WINDOW_MS       150   // Detection-Fenster nach jedem Wakeup.
+                                    // 50 ms reicht NICHT - empirisch verifiziert
+                                    // (4 min Test ohne eine einzige Detektion).
+                                    // Der PAJ-Gesten-Algorithmus braucht ~5+
+                                    // Frames @ 120 Hz Akkumulation, ab 100 ms
+                                    // greift's zuverlaessig.
 
 // =========================================================================
 // Includes
@@ -196,7 +200,6 @@ static void pajSuspend() {
   // Pending ISR verwerfen, INT-Linie geht im SUSPEND HIGH
   pajWoke = false;
   pajState = PAJ_SUSPENDED;
-  DPRINTLN(F("PAJ SUSPEND"));
 }
 
 static void pajResume() {
@@ -213,7 +216,6 @@ static void pajResume() {
   pajRead(PAJ_REG_INT_FLAG_1, dummy);
   pajRead(PAJ_REG_INT_FLAG_2, dummy);
   pajState = PAJ_WAKING;
-  DPRINTLN(F("PAJ RESUME"));
 }
 
 // Nach erfolgreicher Geste: ACTIVE-Hold neu starten (5s default)
@@ -239,9 +241,10 @@ static void handleGesture() {
   bool ok1 = pajRead(PAJ_REG_INT_FLAG_1, f1);
   bool ok2 = pajRead(PAJ_REG_INT_FLAG_2, f2);
 
-  // Immer loggen, solange wir debuggen - so sieht man im Serial Monitor, ob die
-  // Kette PAJ -> PCINT -> ISR -> I2C-Read durchgaengig laeuft.
-  if (n != 0 || f1 != 0 || f2 != 0) {
+  // Loggen nur bei echter Aktivitaet (Flags != 0 oder I2C-Fehler).
+  // Reine "leere Check-Windows" werden nicht gelogged - sonst spammen sie
+  // den Serial Monitor mit ~3-4 Zeilen/s im Idle.
+  if (f1 != 0 || f2 != 0 || !ok1 || !ok2) {
     DPRINT(F("PAJ isr#=")); DDEC(n);
     DPRINT(F(" f1=0x")); DHEX(f1);
     DPRINT(F(" f2=0x")); DHEX(f2);
