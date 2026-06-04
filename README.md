@@ -52,7 +52,7 @@ CC1101 868 MHz auf SPI.
 | `D13` | SCK |     |   |
 | `A4`  |     | SDA |   |
 | `A5`  |     | SCL |   |
-| `D3`  |     | INT (Wake) |   |
+| `A0`  |     | INT (Wake) — PCINT8, weckt aus `Sleep<>` |   |
 | `D8`  |     |     | Config-Taster gegen GND |
 | `D4`  |     |     | Status-LED |
 | `3V3` | VCC | VCC |   |
