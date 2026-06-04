@@ -41,21 +41,18 @@
 #define PEERS_PER_CHANNEL  8
 #define NUM_CHANNELS       9
 
-// ---- Power-Save (Suspend-Cycle) ----
-// Nach Geste bleibt der PAJ ACTIVE_HOLD_MS in OP-Mode (~1.4 mA), reagiert
-// per INT auf weitere Gesten. Danach: SUSPEND (15 µA laut Datasheet 4.3).
-// Im SUSPEND wird der Chip alle WAKE_INTERVAL_MS fuer CHECK_WINDOW_MS
-// kurz aufgeweckt, um auf neue Gesten zu pruefen.
-//   Mittelverbrauch im Idle: 15 µA + (CHECK/INTERVAL × ~1.4 mA)
-//   Default ~280 µA -> 8-10 Monate auf 2× AAA
-#define ACTIVE_HOLD_MS       5000   // Nach letzter Geste in ACTIVE bleiben
-#define WAKE_INTERVAL_MS      250   // Periodische Wakeups im SUSPEND
-#define CHECK_WINDOW_MS       150   // Detection-Fenster nach jedem Wakeup.
-                                    // 50 ms reicht NICHT - empirisch verifiziert
-                                    // (4 min Test ohne eine einzige Detektion).
-                                    // Der PAJ-Gesten-Algorithmus braucht ~5+
-                                    // Frames @ 120 Hz Akkumulation, ab 100 ms
-                                    // greift's zuverlaessig.
+// Power-Saving:
+// Der PAJ7620U2 laeuft permanent in OP-Mode (~1.4 mA). Der chip-eigene
+// OP -> S1 -> S2 Auto-Sleep in der Grove-Init senkt den Verbrauch waehrend
+// laengerer Idle-Phasen auf ~1.5 mA (Datasheet 4.3) - macht keinen relevanten
+// Unterschied. Schaetzung Batterielaufzeit auf 2× AAA (~2000 mAh): 6-8 Wochen.
+//
+// Echte Batterielaufzeit (Monate) waere nur erreichbar mit externem
+// Wake-Trigger (AM312-PIR + GPIO-MOSFET fuer PAJ-VCC), siehe README.
+// Firmware-getriebener Suspend-Cycle wurde getestet und verworfen: der PAJ-
+// Gesten-Algorithmus braucht stabilen Hintergrund/AE/Pipeline-Zustand, der
+// bei jedem Suspend verloren geht - Detektion wird unzuverlaessig und
+// Klassifikation falsch.
 
 // =========================================================================
 // Includes
@@ -135,17 +132,6 @@ static void pajISR() {
   pajIsrCount++;
 }
 
-// ---- Power-State-Machine ----
-enum PajPowerState : uint8_t { PAJ_ACTIVE, PAJ_SUSPENDED, PAJ_WAKING };
-static PajPowerState pajState = PAJ_ACTIVE;
-
-class PajStateAlarm : public Alarm {
-public:
-  PajStateAlarm() : Alarm(0) {}
-  virtual void trigger(__attribute__((unused)) AlarmClock& clock);
-};
-static PajStateAlarm pajStateAlarm;
-
 // ---- I2C-Helper ----
 static bool pajWrite(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(PAJ_I2C_ADDR);
@@ -189,49 +175,11 @@ static bool pajInit() {
   return true;
 }
 
-// ---- PAJ-Suspend / Resume (Bank-Register laut Datasheet V1.0 Sec. 5.14/5.17) ----
-static void pajSuspend() {
-  // Schritt 1: TG disable (Bank 1, R_TG_EnH = 0x00)
-  pajWrite(PAJ_REG_BANK_SEL, 0x01);
-  pajWrite(0x72, 0x00);
-  pajWrite(PAJ_REG_BANK_SEL, 0x00);
-  // Schritt 2: I2C Suspend-Kommando (Bank 0, SW_Suspend_EnL = 0x01)
-  pajWrite(0x03, 0x01);
-  // Pending ISR verwerfen, INT-Linie geht im SUSPEND HIGH
-  pajWoke = false;
-  pajState = PAJ_SUSPENDED;
-}
-
-static void pajResume() {
-  // Schritt 1: I2C-Wake-Up (jeder Slave-Access weckt, Datasheet 6.1.2)
-  uint8_t dummy;
-  pajRead(0x00, dummy);
-  // T2 > 400 us nach Wake-Up vor weiteren Schreibzugriffen
-  delayMicroseconds(500);
-  // Schritt 2: TG enable (Bank 1, R_TG_EnH = 0x01)
-  pajWrite(PAJ_REG_BANK_SEL, 0x01);
-  pajWrite(0x72, 0x01);
-  pajWrite(PAJ_REG_BANK_SEL, 0x00);
-  // Eventuell alten INT-Flag clearen, damit der naechste echte INT ein FALLING ist
-  pajRead(PAJ_REG_INT_FLAG_1, dummy);
-  pajRead(PAJ_REG_INT_FLAG_2, dummy);
-  pajState = PAJ_WAKING;
-}
-
-// Nach erfolgreicher Geste: ACTIVE-Hold neu starten (5s default)
-static void refreshActiveHold() {
-  sysclock.cancel(pajStateAlarm);
-  pajState = PAJ_ACTIVE;
-  pajStateAlarm.set(millis2ticks(ACTIVE_HOLD_MS));
-  sysclock.add(pajStateAlarm);
-}
-
 // Software-Trigger eines KEY-Channels: kurzer Tastendruck
 static void triggerChannel(uint8_t chnum) {
   DPRINT(F("Gesture ch=")); DDECLN(chnum);
   sdev.channel(chnum).state(StateButton<>::pressed);
   sdev.channel(chnum).state(StateButton<>::released);
-  refreshActiveHold();
 }
 
 static void handleGesture() {
@@ -263,39 +211,6 @@ static void handleGesture() {
   else if (f2 & GES_WAVE)      triggerChannel(CH_WAVE);
 }
 
-// ---- State-Machine-Tick ----
-// Wird vom pajStateAlarm aufgerufen. Treibt den Suspend/Wake/Check-Zyklus.
-void PajStateAlarm::trigger(__attribute__((unused)) AlarmClock& clock) {
-  switch (pajState) {
-    case PAJ_ACTIVE:
-      // ACTIVE-Hold abgelaufen -> Chip suspenden
-      pajSuspend();
-      pajStateAlarm.set(millis2ticks(WAKE_INTERVAL_MS));
-      sysclock.add(pajStateAlarm);
-      break;
-
-    case PAJ_SUSPENDED:
-      // Periodisches Wakeup -> Chip enable, CHECK_WINDOW_MS spaeter Flags lesen
-      pajResume();
-      pajStateAlarm.set(millis2ticks(CHECK_WINDOW_MS));
-      sysclock.add(pajStateAlarm);
-      break;
-
-    case PAJ_WAKING:
-      // Detection-Fenster vorbei -> Flags pruefen
-      handleGesture();
-      // handleGesture()->triggerChannel()->refreshActiveHold() hat ggf. den State
-      // bereits auf PAJ_ACTIVE und einen neuen Alarm gesetzt. Falls nicht: zurueck
-      // in den SUSPEND-Zyklus.
-      if (pajState == PAJ_WAKING) {
-        pajSuspend();
-        pajStateAlarm.set(millis2ticks(WAKE_INTERVAL_MS));
-        sysclock.add(pajStateAlarm);
-      }
-      break;
-  }
-}
-
 void setup() {
   DINIT(57600, ASKSIN_PLUS_PLUS_IDENTIFIER);
   sdev.init(hal);
@@ -317,10 +232,6 @@ void setup() {
   Wire.begin();
   Wire.setClock(400000);
   pajInit();
-
-  // Initial ACTIVE-Fenster starten: gibt dem Nutzer nach Boot Zeit
-  // fuer erste Gesten/Test, danach faellt der Chip in den Suspend-Cycle.
-  refreshActiveHold();
 }
 
 void loop() {
