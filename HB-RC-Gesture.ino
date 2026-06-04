@@ -124,8 +124,8 @@ static bool pajInit() {
   // Wake-Sequenz: zweimal lesen, Chip braucht ~700us nach Power-On
   uint8_t dummy;
   pajRead(0x00, dummy);
-  delay(1);
-  pajRead(0x00, dummy);
+ // delay(1);
+ // pajRead(0x00, dummy);
 
   // Part-ID lesen (Bank 0, Reg 0x00..0x01 = 0x20 0x76)
   pajWrite(PAJ_REG_BANK_SEL, 0x00);
@@ -174,17 +174,23 @@ static void handleGesture() {
 void setup() {
   DINIT(57600, ASKSIN_PLUS_PLUS_IDENTIFIER);
   sdev.init(hal);
-  buttonISR(cfgBtn, CONFIG_BUTTON_PIN);
 
+  // Config-Button ZUERST registrieren, damit Pairing-Long-Press
+  // garantiert greift, auch wenn pajInit() unten haengen sollte.
+  buttonISR(cfgBtn, CONFIG_BUTTON_PIN);
+  sdev.initDone();
+
+  // --- ab hier "langsame" Initialisierung NACH initDone() ---
+  // (siehe Memory: AskSin++ EPD setup()-Reihenfolge)
   Wire.begin();
   Wire.setClock(400000);
   pajInit();
 
-  // PAJ-INT als Wakeup-Quelle (active-low pulse bei Gesten-Erkennung)
+  // PAJ-INT als Wakeup-Quelle (active-low pulse bei Gesten-Erkennung).
+  // D3 = INT1 - mit EI_NOTEXTERNAL ist enableInterrupt() hier ein No-op,
+  // daher native attachInterrupt() verwenden.
   pinMode(PAJ_INT_PIN, INPUT_PULLUP);
-  enableInterrupt(PAJ_INT_PIN, pajISR, FALLING);
-
-  sdev.initDone();
+  attachInterrupt(digitalPinToInterrupt(PAJ_INT_PIN), pajISR, FALLING);
 }
 
 void loop() {
