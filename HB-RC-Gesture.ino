@@ -1,29 +1,26 @@
 //- -----------------------------------------------------------------------------------------------------------------------
 // HB-RC-Gesture - AskSin++ Gestensensor mit GY-PAJ7620U2
 // 9 KEY-Channels: Up / Down / Left / Right / Forward / Backward / CW / CCW / Wave
-// ATmega328P (Pro Mini 3.3V) + CC1101 + PAJ7620U2 (I2C) + INT-Wake-on-Gesture
+// ATmega328P (Pro Mini 3.3V) + CC1101 + PAJ7620U2 (I2C) + PCINT-Wake auf A0
+//
+// Referenz-Pattern: AskSinPP-Geraete/HM-SEC-MDIR/HM-SEC-MDIR.ino (verifiziert)
 //- -----------------------------------------------------------------------------------------------------------------------
+
+// =========================================================================
+// USER OPTIONS - Pins / Defaults  (Options-First Pattern: VOR den Includes)
+// =========================================================================
 
 // #define USE_OTA_BOOTLOADER
 
-#define EI_NOTEXTERNAL
-#include <EnableInterrupt.h>
-#include <SPI.h>
-#include <Wire.h>
-#include <AskSinPP.h>
-#include <LowPower.h>
-#include <Register.h>
-#include <MultiChannelDevice.h>
-#include <Remote.h>
-
 // ---- Pin-Belegung (ATmega328P / Pro Mini 3.3V) ----
-#define CONFIG_BUTTON_PIN  8
-#define LED_PIN            4
-#define CC1101_CS         10
-#define CC1101_GDO0        2   // INT0
-#define PAJ_INT_PIN        3   // INT1 - PAJ7620U2 INT/WAKE-OUT
+#define CONFIG_BUTTON_PIN  8        // D8  - PCINT0 - Config-Button gegen GND
+#define LED_PIN            4        // D4  - PCINT20 - Status-LED
+#define CC1101_CS         10        // D10 - SPI CS
+#define CC1101_GDO0        2        // D2  - INT0 - Radio
+#define PAJ_INT_PIN       14        // A0  - PCINT8 - PAJ7620 INT/WAKE-OUT
+                                    //               (entspricht HM-SEC-MDIR PIR_PIN)
 
-// ---- PAJ7620U2 ----
+// ---- I2C / PAJ7620U2 ----
 #define PAJ_I2C_ADDR       0x73
 #define PAJ_REG_BANK_SEL   0xEF
 #define PAJ_REG_INT_FLAG_1 0x43
@@ -40,6 +37,26 @@
 #define GES_CCW       0x80
 #define GES_WAVE      0x01  // im INT_FLAG_2
 
+// ---- AskSin++ ----
+#define PEERS_PER_CHANNEL  8
+#define NUM_CHANNELS       9
+
+// =========================================================================
+// Includes
+// =========================================================================
+
+#define EI_NOTEXTERNAL
+#include <EnableInterrupt.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <AskSinPP.h>
+#include <LowPower.h>
+#include <Register.h>
+#include <MultiChannelDevice.h>
+#include <Remote.h>
+
+// =========================================================================
+
 // Channel-Mapping
 enum GestureChannel : uint8_t {
   CH_UP        = 1,
@@ -52,9 +69,6 @@ enum GestureChannel : uint8_t {
   CH_CCW       = 8,
   CH_WAVE      = 9
 };
-
-#define PEERS_PER_CHANNEL  8
-#define NUM_CHANNELS       9
 
 // PAJ7620U2 Standard-Init-Sequenz (aus Datasheet / Grove-Library, gekuerzt auf das Wesentliche)
 // Format: { register, value }
@@ -96,11 +110,13 @@ Hal hal;
 GestureDevice sdev(devinfo, 0x20);
 ConfigButton<GestureDevice> cfgBtn(sdev);
 
-// PAJ-Interrupt-Flag (gesetzt von ISR, ausgewertet im loop())
-volatile bool pajWoke = false;
+// PAJ-Wake-Flag + ISR-Counter
+volatile bool     pajWoke     = false;
+volatile uint16_t pajIsrCount = 0;
 
 static void pajISR() {
   pajWoke = true;
+  pajIsrCount++;
 }
 
 // ---- I2C-Helper ----
@@ -121,11 +137,9 @@ static bool pajRead(uint8_t reg, uint8_t& val) {
 }
 
 static bool pajInit() {
-  // Wake-Sequenz: zweimal lesen, Chip braucht ~700us nach Power-On
+  // Wake-Sequenz: Chip braucht nach Power-On ~700us, einmal lesen reicht
   uint8_t dummy;
   pajRead(0x00, dummy);
- // delay(1);
- // pajRead(0x00, dummy);
 
   // Part-ID lesen (Bank 0, Reg 0x00..0x01 = 0x20 0x76)
   pajWrite(PAJ_REG_BANK_SEL, 0x00);
@@ -156,9 +170,21 @@ static void triggerChannel(uint8_t chnum) {
 }
 
 static void handleGesture() {
+  uint16_t n = pajIsrCount;
+
   uint8_t f1 = 0, f2 = 0;
-  pajRead(PAJ_REG_INT_FLAG_1, f1);
-  pajRead(PAJ_REG_INT_FLAG_2, f2);
+  bool ok1 = pajRead(PAJ_REG_INT_FLAG_1, f1);
+  bool ok2 = pajRead(PAJ_REG_INT_FLAG_2, f2);
+
+  // Immer loggen, solange wir debuggen - so sieht man im Serial Monitor, ob die
+  // Kette PAJ -> PCINT -> ISR -> I2C-Read durchgaengig laeuft.
+  if (n != 0 || f1 != 0 || f2 != 0) {
+    DPRINT(F("PAJ isr#=")); DDEC(n);
+    DPRINT(F(" f1=0x")); DHEX(f1);
+    DPRINT(F(" f2=0x")); DHEX(f2);
+    if (!ok1 || !ok2) DPRINT(F(" [I2C-ERR]"));
+    DPRINTLN("");
+  }
 
   if      (f1 & GES_UP)        triggerChannel(CH_UP);
   else if (f1 & GES_DOWN)      triggerChannel(CH_DOWN);
@@ -175,22 +201,23 @@ void setup() {
   DINIT(57600, ASKSIN_PLUS_PLUS_IDENTIFIER);
   sdev.init(hal);
 
-  // Config-Button ZUERST registrieren, damit Pairing-Long-Press
-  // garantiert greift, auch wenn pajInit() unten haengen sollte.
+  // Config-Button und PAJ-INT registrieren VOR initDone() - identisches Pattern
+  // wie HM-SEC-MDIR (motionISR fuer PIR, gleicher Aufbau).
   buttonISR(cfgBtn, CONFIG_BUTTON_PIN);
+
+  // PAJ-INT auf A0 (= D14, PCINT8). EI_NOTEXTERNAL ist gesetzt, EnableInterrupt-
+  // Lib nutzt fuer Nicht-INT0/1-Pins automatisch PCINT - PCINT-Change weckt auch
+  // aus SLEEP_MODE_PWR_DOWN sauber auf (das ist auf D2/D3 mit Edge nicht garantiert).
+  pinMode(PAJ_INT_PIN, INPUT_PULLUP);
+  enableInterrupt(PAJ_INT_PIN, pajISR, FALLING);
+
   sdev.initDone();
 
-  // --- ab hier "langsame" Initialisierung NACH initDone() ---
-  // (siehe Memory: AskSin++ EPD setup()-Reihenfolge)
+  // --- "langsame" Initialisierung NACH initDone() ---
+  // (Memory: AskSin++ EPD setup()-Reihenfolge)
   Wire.begin();
   Wire.setClock(400000);
   pajInit();
-
-  // PAJ-INT als Wakeup-Quelle (active-low pulse bei Gesten-Erkennung).
-  // D3 = INT1 - mit EI_NOTEXTERNAL ist enableInterrupt() hier ein No-op,
-  // daher native attachInterrupt() verwenden.
-  pinMode(PAJ_INT_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PAJ_INT_PIN), pajISR, FALLING);
 }
 
 void loop() {
@@ -203,7 +230,7 @@ void loop() {
   }
 
   if (worked == false && poll == false) {
-    // Schlafen bis INT vom PAJ oder Funk-Aktivitaet
+    // Sleep<> = PWR_DOWN - PCINT8 (A0) weckt sauber aus PWR_DOWN.
     hal.activity.savePower<Sleep<>>(hal);
   }
 }
