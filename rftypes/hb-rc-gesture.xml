@@ -7,6 +7,10 @@
     </type>
   </supported_types>
 
+  <!-- Device-level MASTER paramset - muss vorhanden sein, sonst stirbt rfd
+       beim Laden mit "Parameterset MASTER not found" und SIGSEGV. -->
+  <paramset type="MASTER" id="dev_master"/>
+
   <channels>
 
     <!-- Kanal 0: Maintenance -->
