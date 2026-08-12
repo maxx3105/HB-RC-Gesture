@@ -7,6 +7,10 @@ build/
 *.lst
 *.map
 
+# Python (tools/ccu-analysis)
+__pycache__/
+*.pyc
+
 # IDE / editor
 .vscode/
 .idea/
